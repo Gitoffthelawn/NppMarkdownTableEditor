@@ -28,12 +28,12 @@ jobs:
 
     steps:
     - name: Checkout Markdown Table Editor repo
-      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         fetch-depth: 0
 
     - name: Checkout N++ repo
-      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         repository: notepad-plus-plus/notepad-plus-plus
         path: npp_repo
@@ -97,14 +97,14 @@ jobs:
     - name: Commit validated updates to the repo
       if: steps.diff_step.outputs.ANY_DIFFERENCE == 'true'
       id: auto_commit
-      uses: stefanzweifel/git-auto-commit-action@04702edda442b2e678b25b537cec683a1493fcb9 # v7
+      uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d # v7
       with:
         # GitHub will auto-link the upstream ref to the corresponding commit
         commit_message: Sync Notepad++ interface files with notepad-plus-plus/notepad-plus-plus@${{ steps.diff_step.outputs.HEAD_REF }}
 
     - name: Release
       if: steps.auto_commit.outputs.changes_detected == 'true'
-      uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
+      uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
       with:
         name: Markdown Table Editor Notepad++ interface sync ${{ steps.diff_step.outputs.CHANGE_DATE }}.${{github.run_number}}.${{github.run_attempt}}
         tag_name: npp-interface-sync-${{ steps.diff_step.outputs.CHANGE_DATE }}.${{github.run_number}}.${{github.run_attempt}}
