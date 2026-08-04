@@ -412,6 +412,79 @@ int main()
 	expectTrue("expanded auto wrap preserves word-boundary space", joinedSpacedWords.lines[2].find("word wrap here") != std::string::npos);
 	expectTrue("expanded auto wrap does not join separate words", joinedSpacedWords.lines[2].find("wordwrap") == std::string::npos);
 
+	// The third row sets the column width, so "second" would still have fitted after "short".
+	// Wrapping is greedy and never leaves that room, so these are two records, not one wrapped row.
+	const MarkdownTable::EditResult sparseRows = MarkdownTable::applyWrappedToWidth(
+		{
+			"| Name  | Note                     |",
+			"| ----- | ------------------------ |",
+			"| Alice | short                    |",
+			"|       | second                   |",
+			"| Bob   | a much longer value here |"
+		},
+		0,
+		0,
+		200);
+	expectTrue("fit keeps sparse rows ok", sparseRows.ok);
+	expectTrue("fit keeps sparse rows", sparseRows.lines.size() == 5);
+	expectTrue("fit does not merge distinct records", sparseRows.lines[2].find("short second") == std::string::npos);
+
+	// Wrapping fills a cell's segments from the top, so "b" cannot be the second segment of an
+	// empty cell.
+	const MarkdownTable::EditResult segmentUnderEmptyCell = MarkdownTable::applyWrappedToWidth(
+		{ "| A | B |", "| --- | --- |", "| a |  |", "|  | b |" },
+		0,
+		0,
+		200);
+	expectTrue("fit keeps a segment under an empty cell ok", segmentUnderEmptyCell.ok);
+	expectTrue("fit keeps a segment under an empty cell", segmentUnderEmptyCell.lines.size() == 4);
+
+	// The header is wider than the wrap target, so the rendered column is wider than the width the
+	// body segments were actually split at.
+	const MarkdownTable::EditResult narrowUnderHeader = MarkdownTable::applyWrappedToWidth(
+		{ "| Identifier | Description |", "| --- | --- |", "| x | alpha beta gamma delta epsilon |" },
+		2,
+		0,
+		15);
+	expectTrue("fit below the header width ok", narrowUnderHeader.ok);
+	expectTrue("fit below the header width wraps", narrowUnderHeader.lines.size() > 3);
+	const MarkdownTable::EditResult widenedUnderHeader =
+		MarkdownTable::applyWrappedToWidth(narrowUnderHeader.lines, 0, 0, 200);
+	expectTrue("fit rejoins a body wrapped below the header width ok", widenedUnderHeader.ok);
+	expectTrue("fit rejoins a body wrapped below the header width", widenedUnderHeader.lines.size() == 3);
+
+	// Wrapping cuts an over-wide link mid-token, so a fragment no longer parses as a link.
+	const MarkdownTable::EditResult hardSplitLinks = MarkdownTable::applyWrappedToWidth(
+		{ "| A | B |", "| --- | --- |", "| [x y](url) [x y](url) | a |" },
+		2,
+		0,
+		18);
+	expectTrue("hard split link fit ok", hardSplitLinks.ok);
+	expectTrue("hard split link fit wraps", hardSplitLinks.lines.size() > 3);
+	const MarkdownTable::EditResult rejoinedLinks =
+		MarkdownTable::applyWrappedToWidth(hardSplitLinks.lines, 0, 0, 200);
+	expectTrue("fit rejoins hard split constructs ok", rejoinedLinks.ok);
+	expectTrue("fit rejoins hard split constructs", rejoinedLinks.lines.size() == 3);
+	expectTrue(
+		"fit restores the original links",
+		rejoinedLinks.lines[2].find("[x y](url) [x y](url)") != std::string::npos);
+
+	const MarkdownTable::EditResult rejoinedWrap = MarkdownTable::applyWrappedToWidth(
+		{
+			"| Key | Description        |",
+			"| --- | ------------------ |",
+			"| x   | alpha beta gamma   |",
+			"|     | delta epsilon zeta |"
+		},
+		0,
+		0,
+		120);
+	expectTrue("fit rejoins rows that wrapping produced ok", rejoinedWrap.ok);
+	expectTrue("fit rejoins rows that wrapping produced", rejoinedWrap.lines.size() == 3);
+	expectTrue(
+		"fit rebuilds the wrapped sentence",
+		rejoinedWrap.lines[2].find("alpha beta gamma delta epsilon zeta") != std::string::npos);
+
 	const MarkdownTable::EditResult registryWrapped = MarkdownTable::applyWrappedToWidth(
 		{
 			"| patch_id | date | component | target_path | change | evidence | rollback | status | notes |",
