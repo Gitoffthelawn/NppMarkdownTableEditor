@@ -2160,10 +2160,14 @@ bool differsFromSourceRows(const std::vector<std::string> &produced,
 	return false;
 }
 
+std::vector<std::vector<std::string> > parseDelimitedRows(const std::string &text, char delimiter);
+
 char detectDelimiter(const std::string &text)
 {
 	std::size_t tabs = 0;
 	std::size_t commas = 0;
+	bool firstDelimitedRecord = true;
+	bool quotedTabs = false;
 	bool inQuotes = false;
 	bool cellBlank = true;
 
@@ -2172,6 +2176,8 @@ char detectDelimiter(const std::string &text)
 		const char ch = text[i];
 		if (inQuotes)
 		{
+			if (ch == '\t')
+				quotedTabs = true;
 			if (ch == '"' && i + 1 < text.size() && text[i + 1] == '"')
 				++i;
 			else if (ch == '"')
@@ -2181,7 +2187,7 @@ char detectDelimiter(const std::string &text)
 		{
 			inQuotes = true;
 		}
-		else if (ch == '\t')
+		else if (ch == '\t' && firstDelimitedRecord)
 		{
 			++tabs;
 			cellBlank = true;
@@ -2193,9 +2199,10 @@ char detectDelimiter(const std::string &text)
 		}
 		else if (ch == '\r' || ch == '\n')
 		{
-			// Later records may contain literal tabs in CSV fields.
-			if (tabs > 0 || commas > 0)
-				break;
+			if (firstDelimitedRecord && tabs > 0)
+				return '\t';
+			if (commas > 0)
+				firstDelimitedRecord = false;
 			cellBlank = true;
 		}
 		else if (!isSpace(static_cast<unsigned char>(ch)))
@@ -2204,7 +2211,43 @@ char detectDelimiter(const std::string &text)
 		}
 	}
 
-	return tabs > 0 ? '\t' : ',';
+	if (tabs > 0)
+		return '\t';
+	if (text.find('\t') == std::string::npos)
+		return ',';
+
+	// Compare logical body records using each delimiter's quote grammar.
+	// A populated tab-separated field is stronger evidence than tab padding;
+	// punctuation commas in occasional TSV cells need not imply CSV.
+	const auto csv = parseDelimitedRows(text, ',');
+	const auto tsv = parseDelimitedRows(text, '\t');
+	// Continuations of a valid quoted CSV field are not TSV records.
+	if (!csv.empty() && quotedTabs)
+		return ',';
+	std::size_t csvRecords = 0;
+	std::size_t leadingTabs = 0;
+	std::size_t tsvRecords = 0;
+	for (std::size_t row = 1; row < csv.size(); ++row)
+	{
+		if (csv[row].size() > 1)
+		{
+			++csvRecords;
+			if (csv[row][0].find('\t') != std::string::npos)
+				++leadingTabs;
+		}
+	}
+	for (std::size_t row = 1; row < tsv.size(); ++row)
+	{
+		for (std::size_t column = 1; column < tsv[row].size(); ++column)
+		{
+			if (!trim(tsv[row][column]).empty())
+			{
+				++tsvRecords;
+				break;
+			}
+		}
+	}
+	return tsvRecords > csvRecords || (tsvRecords > 0 && tsvRecords == csvRecords && leadingTabs == csvRecords) ? '\t' : ',';
 }
 
 bool hasDelimitedStructure(const std::string &text, char delimiter)
