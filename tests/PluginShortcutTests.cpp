@@ -5,12 +5,16 @@
 #include "../src/PluginDefinition.h"
 
 #include <cwchar>
+#include <cstring>
+#include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <set>
 #include <sstream>
 #include <string>
 
 extern FuncItem funcItem[nbFunc];
+extern NppData nppData;
 
 namespace
 {
@@ -38,6 +42,196 @@ void expectTrue(int &failures, const std::string &name, bool value)
 {
 	if (!value)
 		fail(failures, name, "expected true");
+}
+
+struct EditorProbe
+{
+	LRESULT bytes = 127803254;
+	LRESULT lines = 454045;
+	LRESULT lineWidth = 12;
+	bool readOnly = false;
+	bool continuousTable = false;
+	std::string document;
+	LRESULT currentPosition = 2;
+	int textReads = 0;
+	int replacements = 0;
+	std::string replacementText;
+	std::size_t largestTextRead = 0;
+} editorProbe;
+
+std::size_t probeLineStart(std::size_t row)
+{
+	std::size_t position = 0;
+	while (row-- > 0)
+	{
+		const std::size_t end = editorProbe.document.find('\n', position);
+		if (end == std::string::npos)
+			return editorProbe.document.size();
+		position = end + 1;
+	}
+	return position;
+}
+
+LRESULT CALLBACK probeWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	switch (message)
+	{
+	case NPPM_GETCURRENTSCINTILLA: *reinterpret_cast<int *>(lParam) = 0; return TRUE;
+	case SCI_GETREADONLY: return editorProbe.readOnly;
+	case SCI_GETLENGTH: return editorProbe.document.empty() ? editorProbe.bytes : static_cast<LRESULT>(editorProbe.document.size());
+	case SCI_GETLINECOUNT: return editorProbe.document.empty() ? editorProbe.lines : 1 + static_cast<LRESULT>(std::count(editorProbe.document.begin(), editorProbe.document.end(), '\n'));
+	case SCI_GETCURRENTPOS: return editorProbe.currentPosition;
+	case SCI_GOTOPOS: editorProbe.currentPosition = static_cast<LRESULT>(wParam); return 0;
+	case SCI_LINEFROMPOSITION:
+		return editorProbe.document.empty() ? static_cast<LRESULT>(wParam) / editorProbe.lineWidth :
+			static_cast<LRESULT>(std::count(editorProbe.document.begin(), editorProbe.document.begin() + (std::min)(static_cast<std::size_t>(wParam), editorProbe.document.size()), '\n'));
+	case SCI_POSITIONFROMLINE:
+		return editorProbe.document.empty() ? static_cast<LRESULT>(wParam) * editorProbe.lineWidth : static_cast<LRESULT>(probeLineStart(static_cast<std::size_t>(wParam)));
+	case SCI_GETLINEENDPOSITION:
+	{
+		if (editorProbe.document.empty())
+			return (static_cast<LRESULT>(wParam) + 1) * editorProbe.lineWidth - 1;
+		const std::size_t end = editorProbe.document.find('\n', probeLineStart(static_cast<std::size_t>(wParam)));
+		return static_cast<LRESULT>(end == std::string::npos ? editorProbe.document.size() : end);
+	}
+	case SCI_GETTEXTRANGEFULL:
+	{
+		++editorProbe.textReads;
+		Sci_TextRangeFull *range = reinterpret_cast<Sci_TextRangeFull *>(lParam);
+		editorProbe.largestTextRead = (std::max)(editorProbe.largestTextRead, static_cast<std::size_t>(range->chrg.cpMax - range->chrg.cpMin));
+		if (!editorProbe.document.empty())
+		{
+			const std::string text = editorProbe.document.substr(static_cast<std::size_t>(range->chrg.cpMin),
+				static_cast<std::size_t>(range->chrg.cpMax - range->chrg.cpMin));
+			std::memcpy(range->lpstrText, text.c_str(), text.size() + 1);
+			return static_cast<LRESULT>(text.size());
+		}
+		std::string text;
+		for (Sci_Position position = range->chrg.cpMin; position < range->chrg.cpMax; ++position)
+		{
+			const LRESULT row = position / editorProbe.lineWidth;
+			const std::size_t column = static_cast<std::size_t>(position % editorProbe.lineWidth);
+			const std::string line = row == 0 ? "| A | B |" : row == 1 ? "| - | - |" :
+				(row == 2 || editorProbe.continuousTable) ? "| x | yy |" : "";
+			text += column == static_cast<std::size_t>(editorProbe.lineWidth - 1) ? '\n' :
+				column < line.size() ? line[column] : ' ';
+		}
+		std::memcpy(range->lpstrText, text.c_str(), text.size() + 1);
+		return static_cast<LRESULT>(text.size());
+	}
+	case SCI_REPLACETARGET:
+		++editorProbe.replacements;
+		editorProbe.replacementText.assign(reinterpret_cast<const char *>(lParam), static_cast<std::size_t>(wParam));
+		return static_cast<LRESULT>(wParam);
+	default: return ::DefWindowProc(hwnd, message, wParam, lParam);
+	}
+}
+
+void testAutomaticWorkBounds(int &failures)
+{
+	WNDCLASS windowClass = {};
+	windowClass.lpfnWndProc = probeWindowProc;
+	windowClass.hInstance = ::GetModuleHandle(NULL);
+	windowClass.lpszClassName = L"MarkdownTableEditorWorkBoundsTest";
+	::RegisterClass(&windowClass);
+	HWND window = ::CreateWindow(windowClass.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, windowClass.hInstance, NULL);
+	expectTrue(failures, "create editor message probe", window != NULL);
+	if (!window)
+		return;
+	const NppData savedData = nppData;
+	nppData._nppHandle = window;
+	nppData._scintillaMainHandle = window;
+	const bool savedFit = MarkdownTablePluginTesting::autoFitTableEnabledForTests();
+	MarkdownTablePluginTesting::setAutoFitTableEnabledForTests(false);
+
+	editorProbe = EditorProbe();
+	expectTrue(failures, "122 MiB automatic open avoids scanning text", !MarkdownTablePluginTesting::autoFormatDocumentForTests() && editorProbe.textReads == 0);
+	editorProbe.bytes = 500000;
+	expectTrue(failures, "many short lines avoid automatic document scan", !MarkdownTablePluginTesting::autoFormatDocumentForTests() && editorProbe.textReads == 0);
+	editorProbe.lines = 4;
+	editorProbe.readOnly = true;
+	expectTrue(failures, "read-only document avoids formatting", !MarkdownTablePluginTesting::autoFormatDocumentForTests() && editorProbe.textReads == 0);
+	expectTrue(failures, "read-only current table avoids formatting", !MarkdownTablePluginTesting::alignCurrentTableForTests(true) && editorProbe.textReads == 0);
+	editorProbe.readOnly = false;
+	editorProbe.lineWidth = 200000;
+	expectTrue(failures, "oversized current line is rejected before allocation", !MarkdownTablePluginTesting::alignCurrentTableForTests(true) && editorProbe.textReads == 0);
+	editorProbe = EditorProbe();
+	editorProbe.continuousTable = true;
+	expectTrue(failures, "huge table scan is bounded", !MarkdownTablePluginTesting::alignCurrentTableForTests(true) && editorProbe.textReads <= 1002 && editorProbe.replacements == 0);
+	editorProbe = EditorProbe();
+	expectTrue(failures, "small table in large document still auto aligns", MarkdownTablePluginTesting::alignCurrentTableForTests(true) && editorProbe.replacements == 1 && editorProbe.textReads < 20);
+	editorProbe = EditorProbe();
+	expectTrue(failures, "explicit table command works in large document", MarkdownTablePluginTesting::alignCurrentTableForTests(false) && editorProbe.replacements == 1);
+	editorProbe = EditorProbe();
+	editorProbe.bytes = 48;
+	editorProbe.lines = 4;
+	expectTrue(failures, "small document still formats on open", MarkdownTablePluginTesting::autoFormatDocumentForTests() && editorProbe.replacements == 1);
+	editorProbe = EditorProbe();
+	editorProbe.readOnly = true;
+	expectTrue(failures, "manual formatting cannot replace read-only text", !MarkdownTablePluginTesting::alignCurrentTableForTests(false) && editorProbe.replacements == 0);
+	editorProbe.document = "| A   | B   |\n| --- | --- |\n| x   | yy  |";
+	editorProbe.bytes = static_cast<LRESULT>(editorProbe.document.size());
+	editorProbe.lines = 3;
+	editorProbe.lineWidth = 14;
+	nextCell();
+	expectTrue(failures, "next cell navigates a formatted read-only table", editorProbe.currentPosition > 2 && editorProbe.replacements == 0);
+	previousCell();
+	expectTrue(failures, "previous cell navigates a formatted read-only table", editorProbe.currentPosition == 2 && editorProbe.replacements == 0);
+	editorProbe = EditorProbe();
+	const std::string smallTable = "| A | B |\n| - | - |\n| x | yy |";
+	editorProbe.document = std::string(200000, 'x') + "\n" + smallTable;
+	editorProbe.currentPosition = 200003;
+	expectTrue(failures, "long preceding prose does not disable a small table", MarkdownTablePluginTesting::alignCurrentTableForTests(true) && editorProbe.replacements == 1 && editorProbe.largestTextRead < 100);
+	editorProbe = EditorProbe();
+	editorProbe.document = smallTable + "\n" + std::string(200000, 'x');
+	expectTrue(failures, "long following prose does not disable a small table", MarkdownTablePluginTesting::alignCurrentTableForTests(true) && editorProbe.replacements == 1 && editorProbe.largestTextRead < 100);
+	editorProbe = EditorProbe();
+	editorProbe.document = smallTable;
+	for (int row = 0; row < 600; ++row)
+		editorProbe.document += "\nprose | value";
+	expectTrue(failures, "following pipe prose does not count toward the table budget", MarkdownTablePluginTesting::alignCurrentTableForTests(true) && editorProbe.replacements == 1 && editorProbe.textReads < 1020);
+	editorProbe = EditorProbe();
+	for (int row = 0; row < 600; ++row)
+		editorProbe.document += "prose | value\n";
+	editorProbe.currentPosition = static_cast<LRESULT>(editorProbe.document.size()) + 2;
+	editorProbe.document += smallTable;
+	expectTrue(failures, "preceding pipe prose does not count toward the table budget", MarkdownTablePluginTesting::alignCurrentTableForTests(true) && editorProbe.replacements == 1 && editorProbe.textReads < 1020 && editorProbe.replacementText.find("yy") != std::string::npos);
+	editorProbe = EditorProbe();
+	editorProbe.continuousTable = true;
+	editorProbe.currentPosition = 600 * editorProbe.lineWidth + 2;
+	expectTrue(failures, "truncated large table without its header is not formatted", !MarkdownTablePluginTesting::alignCurrentTableForTests(true) && editorProbe.replacements == 0 && editorProbe.textReads < 2020);
+	editorProbe = EditorProbe();
+	editorProbe.document = smallTable;
+	for (int row = 0; row < 497; ++row)
+		editorProbe.document += "\n| x | yy |";
+	editorProbe.document += "\nprose | value";
+	expectTrue(failures, "lookahead preserves a table exactly at the line limit", MarkdownTablePluginTesting::alignCurrentTableForTests(true) && editorProbe.replacements == 1);
+	editorProbe = EditorProbe();
+	for (int column = 0; column < 20000; ++column)
+		editorProbe.document += "|x";
+	editorProbe.document += "|\n";
+	for (int column = 0; column < 20000; ++column)
+		editorProbe.document += "|-";
+	editorProbe.document += "|";
+	for (int row = 0; row < 498; ++row)
+		editorProbe.document += "\n|x|";
+	expectTrue(failures, "ragged table cannot expand through automatic typing", !MarkdownTablePluginTesting::alignCurrentTableForTests(true) && editorProbe.replacements == 0);
+	expectTrue(failures, "ragged table cannot expand through automatic open", !MarkdownTablePluginTesting::autoFormatDocumentForTests() && editorProbe.replacements == 0);
+	editorProbe = EditorProbe();
+	editorProbe.document = "|" + std::string(30000, 'x') + "| B |\n| - | - |";
+	for (int row = 0; row < 20; ++row)
+		editorProbe.document += "\n|x|y|";
+	expectTrue(failures, "wide cells have a projected output bound", !MarkdownTablePluginTesting::alignCurrentTableForTests(true) && editorProbe.replacements == 0);
+	const std::vector<std::string> noSeparator(10000, "| x | y |");
+	const auto scanStart = std::chrono::steady_clock::now();
+	expectTrue(failures, "pipe-only document has no table ranges", MarkdownTablePluginTesting::documentMarkdownTableRangeLinesForTests(noSeparator).empty());
+	expectTrue(failures, "pipe-only document scan stays below two seconds", std::chrono::steady_clock::now() - scanStart < std::chrono::seconds(2));
+	std::cout << "Automatic range scan (10000 pipe lines): " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scanStart).count() << " ms\n";
+
+	nppData = savedData;
+	MarkdownTablePluginTesting::setAutoFitTableEnabledForTests(savedFit);
+	::DestroyWindow(window);
+	::UnregisterClass(windowClass.lpszClassName, windowClass.hInstance);
 }
 
 void expectSize(int &failures, const std::string &name, std::size_t actual, std::size_t expected)
@@ -576,5 +770,6 @@ int runPluginShortcutTests()
 		"| H   |     |\n| --- | --- |\n| a   |     |");
 	expectSize(failures, "plugin short column replacement caret", shortColumnPreview.caretOffset, shortColumnPreview.text.find("    |", shortColumnPreview.text.find("| a")));
 
+	testAutomaticWorkBounds(failures);
 	return failures;
 }
