@@ -2339,6 +2339,17 @@ bool shouldDeferInitialAutoTableFormatForDocumentLength(LRESULT textLength)
 	return textLength <= 0;
 }
 
+// Automatic work runs on the editor thread. Bound it before reading text;
+// explicit table commands remain available regardless of document size.
+const LRESULT automaticDocumentByteLimit = 1024 * 1024;
+const LRESULT automaticDocumentLineLimit = 10000;
+const std::size_t automaticDocumentOutputByteLimit = 1024 * 1024;
+const Sci_Position automaticTableByteLimit = 128 * 1024;
+const std::size_t automaticTableLineLimit = 500;
+const std::size_t automaticTableColumnLimit = 64;
+const std::size_t automaticTableCellLimit = 8192;
+const std::size_t automaticTableOutputByteLimit = 256 * 1024;
+
 int availableTextPixelWidth(HWND scintilla)
 {
 	if (!scintilla)
@@ -2892,6 +2903,8 @@ bool captureEnterColumnToPreserve(HWND hwnd, UINT message, WPARAM key, std::size
 	const LRESULT line = ::SendMessage(hwnd, SCI_LINEFROMPOSITION, static_cast<WPARAM>(currentPos), 0);
 	if (line < 0)
 		return false;
+	if (lineEndPosition(hwnd, static_cast<std::size_t>(line)) - lineStartPosition(hwnd, static_cast<std::size_t>(line)) > automaticTableByteLimit)
+		return false;
 
 	const bool tableLine = MarkdownTable::isPotentialTableLine(getLineText(hwnd, static_cast<std::size_t>(line)));
 	if (!shouldPreserveEnterColumn(true, true, tableLine, message, key))
@@ -3023,48 +3036,33 @@ std::vector<std::string> readDocumentLines(HWND scintilla, std::size_t lineCount
 std::vector<DocumentTableRange> findDocumentTableRanges(const std::vector<std::string> &lines)
 {
 	std::vector<DocumentTableRange> ranges;
-	std::size_t line = 0;
-	while (line < lines.size())
+	const std::vector<MarkdownTable::TableRange> coreRanges = MarkdownTable::findTableRanges(lines);
+	for (std::size_t i = 0; i < coreRanges.size(); ++i)
 	{
-		if (!MarkdownTable::isPotentialTableLine(lines[line]))
-		{
-			++line;
-			continue;
-		}
-
-		const std::size_t blockStart = line;
-		std::vector<std::string> blockLines;
-		while (line < lines.size() && MarkdownTable::isPotentialTableLine(lines[line]))
-		{
-			blockLines.push_back(lines[line]);
-			++line;
-		}
-
-		std::size_t searchRow = 0;
-		while (searchRow < blockLines.size())
-		{
-			bool found = false;
-			for (std::size_t targetRow = searchRow; targetRow < blockLines.size(); ++targetRow)
-			{
-				const MarkdownTable::TableRange tableRange = MarkdownTable::findTableRange(blockLines, coreIndex(targetRow));
-				if (!tableRange.found || tableRange.lastRow < searchRow)
-					continue;
-
-				DocumentTableRange range;
-				range.firstLine = blockStart + tableRange.firstRow;
-				range.lastLine = blockStart + tableRange.lastRow;
-				if (ranges.empty() || range.firstLine > ranges.back().lastLine)
-					ranges.push_back(range);
-				searchRow = tableRange.lastRow + 1;
-				found = true;
-				break;
-			}
-
-			if (!found)
-				break;
-		}
+		DocumentTableRange range;
+		range.firstLine = coreRanges[i].firstRow;
+		range.lastLine = coreRanges[i].lastRow;
+		ranges.push_back(range);
 	}
 	return ranges;
+}
+
+bool automaticTableWorkAllowed(const std::vector<std::string> &lines)
+{
+	if (lines.empty())
+		return false;
+	std::size_t estimatedColumns = 1;
+	std::size_t maximumLineBytes = 0;
+	for (std::size_t i = 0; i < lines.size(); ++i)
+	{
+		// Counting every pipe intentionally overestimates escaped/outer delimiters.
+		estimatedColumns = (std::max)(estimatedColumns, 1 + static_cast<std::size_t>(std::count(lines[i].begin(), lines[i].end(), '|')));
+		maximumLineBytes = (std::max)(maximumLineBytes, lines[i].size());
+	}
+	if (estimatedColumns > automaticTableColumnLimit || lines.size() > automaticTableCellLimit / estimatedColumns)
+		return false;
+	// Each cell is no wider than its source line; allow delimiters, padding and EOL.
+	return maximumLineBytes + 4 <= automaticTableOutputByteLimit / (estimatedColumns * lines.size());
 }
 
 bool collectDocumentTableReplacement(HWND scintilla, const std::vector<std::string> &documentLines, std::size_t lineCount, MarkdownTable::Action action, const DocumentTableRange &range, DocumentTableReplacement &replacement)
@@ -3075,6 +3073,8 @@ bool collectDocumentTableReplacement(HWND scintilla, const std::vector<std::stri
 	std::vector<std::string> tableLines;
 	for (std::size_t i = range.firstLine; i <= range.lastLine; ++i)
 		tableLines.push_back(documentLines[i]);
+	if (!automaticTableWorkAllowed(tableLines))
+		return false;
 
 	MarkdownTable::EditResult edit = MarkdownTable::apply(tableLines, 0, 0, coreActionForPluginAction(action));
 	if (!edit.ok)
@@ -3099,11 +3099,14 @@ bool collectDocumentTableReplacement(HWND scintilla, const std::vector<std::stri
 bool runAutoTableFormatForDocument(MarkdownTable::Action action)
 {
 	HWND scintilla = currentScintilla();
-	if (!scintilla)
+	if (!scintilla || ::SendMessage(scintilla, SCI_GETREADONLY, 0, 0))
+		return false;
+	const LRESULT textLength = ::SendMessage(scintilla, SCI_GETLENGTH, 0, 0);
+	if (textLength <= 0 || textLength > automaticDocumentByteLimit)
 		return false;
 
 	const LRESULT lineCountResult = ::SendMessage(scintilla, SCI_GETLINECOUNT, 0, 0);
-	if (lineCountResult <= 0)
+	if (lineCountResult <= 0 || lineCountResult > automaticDocumentLineLimit)
 		return false;
 	const std::size_t lineCount = static_cast<std::size_t>(lineCountResult);
 	const std::vector<std::string> documentLines = readDocumentLines(scintilla, lineCount);
@@ -3112,11 +3115,20 @@ bool runAutoTableFormatForDocument(MarkdownTable::Action action)
 		return false;
 
 	std::vector<DocumentTableReplacement> replacements;
+	std::size_t replacementBytes = 0;
 	for (std::size_t i = 0; i < ranges.size(); ++i)
 	{
+		if (ranges[i].lastLine - ranges[i].firstLine + 1 > automaticTableLineLimit ||
+			lineEndPosition(scintilla, ranges[i].lastLine) - lineStartPosition(scintilla, ranges[i].firstLine) > automaticTableByteLimit)
+			continue;
 		DocumentTableReplacement replacement;
 		if (collectDocumentTableReplacement(scintilla, documentLines, lineCount, action, ranges[i], replacement))
+		{
+			if (replacement.text.size() > automaticDocumentOutputByteLimit - replacementBytes)
+				return false;
+			replacementBytes += replacement.text.size();
 			replacements.push_back(replacement);
+		}
 	}
 	if (replacements.empty())
 		return false;
@@ -4005,10 +4017,27 @@ bool promptTableSize(TableSizeDialogState &state)
 	return state.accepted;
 }
 
+bool startsWithTablePipe(const std::string &line)
+{
+	const std::size_t first = line.find_first_not_of(" \t\r\n\f\v");
+	return first != std::string::npos && line[first] == '|';
+}
+
+bool oversizedNeighborMayBelongToTable(HWND scintilla, std::size_t line, const std::vector<std::string> &lines, const MarkdownTable::TableRange &range)
+{
+	if (!startsWithTablePipe(lines[range.firstRow]) || !startsWithTablePipe(lines[range.firstRow + 1]))
+		return true; // An optional-leading-pipe table can continue anywhere in the oversized line.
+	const Sci_Position start = lineStartPosition(scintilla, line);
+	const std::string prefix = getRangeText(scintilla, start, start + 64);
+	const std::size_t first = prefix.find_first_not_of(" \t\r\n\f\v");
+	// Unknown (long indentation) must not turn an incomplete table into an editable prefix.
+	return first == std::string::npos || prefix[first] == '|';
+}
+
 bool runTableAction(MarkdownTable::Action action, bool quiet, CaretPlacement caretPlacement)
 {
 	HWND scintilla = currentScintilla();
-	if (!scintilla)
+	if (!scintilla || (quiet && ::SendMessage(scintilla, SCI_GETREADONLY, 0, 0)))
 		return false;
 
 	const LRESULT lineCountResult = ::SendMessage(scintilla, SCI_GETLINECOUNT, 0, 0);
@@ -4025,6 +4054,10 @@ bool runTableAction(MarkdownTable::Action action, bool quiet, CaretPlacement car
 	if (currentLine >= lineCount)
 		currentLine = lineCount - 1;
 
+	const Sci_Position currentLineStart = lineStartPosition(scintilla, currentLine);
+	const Sci_Position currentLineEnd = lineEndPosition(scintilla, currentLine);
+	if (quiet && currentLineEnd - currentLineStart > automaticTableByteLimit)
+		return false;
 	const std::string currentLineText = getLineText(scintilla, currentLine);
 	if (!MarkdownTable::isPotentialTableLine(currentLineText))
 	{
@@ -4034,18 +4067,56 @@ bool runTableAction(MarkdownTable::Action action, bool quiet, CaretPlacement car
 	}
 
 	std::size_t potentialFirstLine = currentLine;
-	while (potentialFirstLine > 0 && MarkdownTable::isPotentialTableLine(getLineText(scintilla, potentialFirstLine - 1)))
+	bool truncatedBefore = false;
+	bool oversizedBefore = false;
+	while (potentialFirstLine > 0)
+	{
+		if (quiet && lineEndPosition(scintilla, potentialFirstLine - 1) - lineStartPosition(scintilla, potentialFirstLine - 1) > automaticTableByteLimit)
+		{
+			oversizedBefore = true;
+			break;
+		}
+		if (!MarkdownTable::isPotentialTableLine(getLineText(scintilla, potentialFirstLine - 1)))
+			break;
+		if (quiet && (currentLine - potentialFirstLine + 1 >= automaticTableLineLimit ||
+			currentLineEnd - lineStartPosition(scintilla, potentialFirstLine - 1) > automaticTableByteLimit))
+		{
+			--potentialFirstLine;
+			truncatedBefore = true;
+			break;
+		}
 		--potentialFirstLine;
+	}
 
 	std::size_t potentialLastLine = currentLine;
-	while (potentialLastLine + 1 < lineCount && MarkdownTable::isPotentialTableLine(getLineText(scintilla, potentialLastLine + 1)))
+	bool oversizedAfter = false;
+	while (potentialLastLine + 1 < lineCount)
+	{
+		if (quiet && lineEndPosition(scintilla, potentialLastLine + 1) - lineStartPosition(scintilla, potentialLastLine + 1) > automaticTableByteLimit)
+		{
+			oversizedAfter = true;
+			break;
+		}
+		if (!MarkdownTable::isPotentialTableLine(getLineText(scintilla, potentialLastLine + 1)))
+			break;
+		if (quiet && (potentialLastLine - currentLine + 1 >= automaticTableLineLimit ||
+			lineEndPosition(scintilla, potentialLastLine + 1) - currentLineStart > automaticTableByteLimit))
+		{
+			// Keep one lookahead row so the core can distinguish a table continuation
+			// from pipe-containing prose before applying limits to the actual table.
+			++potentialLastLine;
+			break;
+		}
 		++potentialLastLine;
+	}
 
 	std::vector<std::string> candidateLines;
 	for (std::size_t i = potentialFirstLine; i <= potentialLastLine; ++i)
 		candidateLines.push_back(getLineText(scintilla, i));
 
 	const MarkdownTable::TableRange tableRange = MarkdownTable::findTableRange(candidateLines, coreIndex(currentLine - potentialFirstLine));
+	if (quiet && truncatedBefore && tableRange.found && tableRange.firstRow == 0)
+		return false;
 	if (!tableRange.found)
 	{
 		if (!quiet)
@@ -4055,12 +4126,21 @@ bool runTableAction(MarkdownTable::Action action, bool quiet, CaretPlacement car
 
 	const std::size_t firstLine = potentialFirstLine + tableRange.firstRow;
 	const std::size_t lastLine = potentialFirstLine + tableRange.lastRow;
+	if (quiet && ((oversizedBefore && tableRange.firstRow == 0 &&
+		oversizedNeighborMayBelongToTable(scintilla, potentialFirstLine - 1, candidateLines, tableRange)) ||
+		(oversizedAfter && tableRange.lastRow + 1 == candidateLines.size() &&
+		oversizedNeighborMayBelongToTable(scintilla, potentialLastLine + 1, candidateLines, tableRange))))
+		return false;
+	if (quiet && (lastLine - firstLine + 1 > automaticTableLineLimit ||
+		lineEndPosition(scintilla, lastLine) - lineStartPosition(scintilla, firstLine) > automaticTableByteLimit))
+		return false;
 	std::vector<std::string> tableLines;
 	for (std::size_t i = tableRange.firstRow; i <= tableRange.lastRow; ++i)
 		tableLines.push_back(candidateLines[i]);
+	if (quiet && !automaticTableWorkAllowed(tableLines))
+		return false;
 
 	const std::size_t row = currentLine - firstLine;
-	const Sci_Position currentLineStart = lineStartPosition(scintilla, currentLine);
 	const std::size_t byteColumn = static_cast<std::size_t>((std::max)(static_cast<LRESULT>(0), currentPosResult - static_cast<LRESULT>(currentLineStart)));
 	const std::size_t column = MarkdownTable::columnFromCursor(currentLineText, byteColumn);
 	const CellCaretSnapshot preservedCaret = caretPlacement == CaretPlacement::PreserveCellOffset
@@ -4103,6 +4183,8 @@ bool runTableAction(MarkdownTable::Action action, bool quiet, CaretPlacement car
 			::SendMessage(scintilla, SCI_GOTOPOS, static_cast<WPARAM>(targetPosition), 0);
 		return true;
 	}
+	if (::SendMessage(scintilla, SCI_GETREADONLY, 0, 0))
+		return false;
 
 	ScintillaUndoAction undo(scintilla);
 	PluginEditGuard pluginEdit;
@@ -4446,6 +4528,16 @@ bool shouldTryQueuedInitialAutoTableFormatForNotificationForTests(UINT notificat
 bool shouldDeferInitialAutoTableFormatForDocumentLengthForTests(long textLength)
 {
 	return shouldDeferInitialAutoTableFormatForDocumentLength(static_cast<LRESULT>(textLength));
+}
+
+bool autoFormatDocumentForTests()
+{
+	return runAutoTableFormatForDocument(MarkdownTable::Action::Align);
+}
+
+bool alignCurrentTableForTests(bool automatic)
+{
+	return runTableAction(MarkdownTable::Action::Align, automatic, CaretPlacement::PreserveCellOffset);
 }
 
 std::vector<std::size_t> documentMarkdownTableRangeLinesForTests(const std::vector<std::string> &lines)
